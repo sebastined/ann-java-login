@@ -37,6 +37,11 @@ pipeline {
       sh 'mvn clean package'
        }
     }
-  
+     stage ('Deploy-To-Tomcat') {
+            steps {
+           sshagent(['tomcat']) {
+                sh 'scp -o StrictHostKeyChecking=no /var/lib/jenkins/workspace/java-app/target/dptweb-1.0.war ubuntu@10.0.0.4:/usr/local/tom11/webapps/java.war'
+              }      
+           }    
     }
 }
