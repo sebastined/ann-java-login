@@ -19,7 +19,7 @@ spec:
           mountPath: /home/jenkins/agent
 
     - name: maven
-      image: maven:3.9.4-jdk-17
+      image: maven
       command: ['sh', '-c', 'sleep infinity']
       tty: true
       workingDir: /home/jenkins/agent
