@@ -19,7 +19,7 @@ spec:
           mountPath: /home/jenkins/agent
 
     - name: maven
-      image: maven
+      image: maven:3.9.4-openjdk-17
       command: ['sh', '-c', 'sleep infinity']
       tty: true
       workingDir: /home/jenkins/agent
@@ -48,15 +48,6 @@ spec:
         - name: workspace-volume
           mountPath: /home/jenkins/agent
 
-    - name: trufflehog
-      image: harbor.int.sebastine.ng/900/trufflehog:latest
-      command: ['sh', '-c', 'sleep infinity']
-      tty: true
-      workingDir: /home/jenkins/agent
-      volumeMounts:
-        - name: workspace-volume
-          mountPath: /home/jenkins/agent
-
   volumes:
     - name: harbor-creds
       secret:
@@ -78,6 +69,7 @@ spec:
     TAG           = "${BUILD_NUMBER}"
     K8S_NAMESPACE = "dev00"
     INGRESS_HOST  = "${APP_NAME}.int.sebastine.ng"
+    TRUFFLE_NAME  = "trufflehog"
   }
 
   stages {
@@ -111,7 +103,7 @@ spec:
     stage('Build Java App') {
       steps {
         container('maven') {
-          sh 'mvn clean package'
+          sh 'mvn -B -DskipTests clean package'
         }
       }
     }
@@ -120,7 +112,9 @@ spec:
       steps {
         container('kaniko') {
           sh '''
+            set -e
             IMAGE_DEST="${IMAGE_NAME}:${TAG}"
+            echo "Building and pushing Java image: ${IMAGE_DEST}"
             /kaniko/executor \
               --context "$PWD" \
               --dockerfile Dockerfile \
@@ -132,15 +126,17 @@ spec:
       }
     }
 
-    stage('Build & Push TruffleHog Image') {
+    stage('Build & Push TruffleHog Image (tagged)') {
       steps {
         container('kaniko') {
           sh '''
-            IMAGE_TRUFFLEHOG="${REGISTRY}/trufflehog:latest"
+            set -e
+            IMAGE_TRUFFLE="${REGISTRY}/${TRUFFLE_NAME}:${TAG}"
+            echo "Building and pushing TruffleHog image: ${IMAGE_TRUFFLE}"
             /kaniko/executor \
               --context "$PWD" \
               --dockerfile T-Dockerfile \
-              --destination "${IMAGE_TRUFFLEHOG}" \
+              --destination "${IMAGE_TRUFFLE}" \
               --cache=true \
               --insecure --skip-tls-verify
           '''
@@ -148,13 +144,53 @@ spec:
       }
     }
 
-    stage('Run TruffleHog Scan') {
+    stage('Run TruffleHog Scan (transient pod)') {
       steps {
-        container('trufflehog') {
+        container('kubectl') {
           sh '''
-            rm -f trufflehog.json || true
-            trufflehog --json ${GIT_REPO} > trufflehog.json
-            cat trufflehog.json
+            set -e
+            POD_NAME="trufflehog-scan-${TAG}"
+            IMAGE_TRUFFLE="${REGISTRY}/${TRUFFLE_NAME}:${TAG}"
+            echo "Launching transient pod ${POD_NAME} in namespace ${K8S_NAMESPACE} with image ${IMAGE_TRUFFLE}..."
+
+            kubectl apply -n ${K8S_NAMESPACE} -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${POD_NAME}
+  labels:
+    app: trufflehog-scan
+spec:
+  restartPolicy: Never
+  imagePullSecrets:
+    - name: harbor-creds
+  containers:
+    - name: trufflehog
+      image: ${IMAGE_TRUFFLE}
+      # If the image ENTRYPOINT is trufflehog you may not need command/args;
+      # using args here to be explicit
+      command: ["trufflehog"]
+      args: ["--json", "${GIT_REPO}"]
+EOF
+
+            # wait for pod to start and finish
+            echo "Waiting for pod to enter a terminal phase..."
+            for i in $(seq 1 60); do
+              PHASE=$(kubectl -n ${K8S_NAMESPACE} get pod ${POD_NAME} -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+              echo "  ${POD_NAME} phase: ${PHASE}"
+              if [ "${PHASE}" = "Succeeded" ] || [ "${PHASE}" = "Failed" ]; then
+                break
+              fi
+              sleep 2
+            done
+
+            echo "Collecting logs to trufflehog-${TAG}.json"
+            kubectl -n ${K8S_NAMESPACE} logs ${POD_NAME} > trufflehog-${TAG}.json || true
+            echo "----- TruffleHog output (first 200 lines) -----"
+            sed -n '1,200p' trufflehog-${TAG}.json || true
+
+            # cleanup pod
+            kubectl -n ${K8S_NAMESPACE} delete pod ${POD_NAME} --ignore-not-found --wait=true || true
           '''
         }
       }
@@ -164,9 +200,9 @@ spec:
       steps {
         container('kubectl') {
           sh '''
+            set -e
             echo "Deploying ${APP_NAME}:${TAG} to ${K8S_NAMESPACE}..."
 
-            # Deployment
             kubectl apply -n ${K8S_NAMESPACE} -f - <<EOF
 apiVersion: apps/v1
 kind: Deployment
@@ -191,7 +227,6 @@ spec:
         - containerPort: 8080
 EOF
 
-            # Service
             kubectl apply -n ${K8S_NAMESPACE} -f - <<EOF
 apiVersion: v1
 kind: Service
@@ -206,7 +241,6 @@ spec:
   type: ClusterIP
 EOF
 
-            # Ingress (Traefik)
             kubectl apply -n ${K8S_NAMESPACE} -f - <<EOF
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -234,7 +268,6 @@ spec:
               number: 8080
 EOF
 
-            # Wait for rollout
             kubectl -n ${K8S_NAMESPACE} rollout status deployment/${APP_NAME}-deploy --timeout=120s
           '''
         }
@@ -244,10 +277,12 @@ EOF
 
   post {
     success {
-      echo "✅ Successfully built and deployed ${APP_NAME}:${TAG} to Kubernetes"
+      echo "✅ Success: built images (tag ${TAG}), ran TruffleHog, and deployed ${APP_NAME}:${TAG}"
+      archiveArtifacts artifacts: "trufflehog-${TAG}.json", allowEmptyArchive: true
     }
     failure {
-      echo "❌ Pipeline failed — check logs for details"
+      echo "❌ Pipeline failed — check logs"
+      archiveArtifacts artifacts: "trufflehog-${TAG}.json", allowEmptyArchive: true
     }
   }
 }
