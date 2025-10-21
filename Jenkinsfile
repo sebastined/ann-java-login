@@ -27,24 +27,6 @@ spec:
         - name: workspace-volume
           mountPath: /home/jenkins/agent
 
-    - name: trufflehog
-      image: python:3.12-alpine
-      command: ['sh', '-c', 'sleep infinity']
-      tty: true
-      workingDir: /home/jenkins/agent
-      volumeMounts:
-        - name: workspace-volume
-          mountPath: /home/jenkins/agent
-
-    - name: owasp
-      image: owasp/dependency-check:latest
-      command: ['sh', '-c', 'sleep infinity']
-      tty: true
-      workingDir: /home/jenkins/agent
-      volumeMounts:
-        - name: workspace-volume
-          mountPath: /home/jenkins/agent
-
     - name: kaniko
       image: gcr.io/kaniko-project/executor:debug
       command: ['sh', '-c', 'sleep infinity']
@@ -59,6 +41,15 @@ spec:
 
     - name: kubectl
       image: lachlanevenson/k8s-kubectl:latest
+      command: ['sh', '-c', 'sleep infinity']
+      tty: true
+      workingDir: /home/jenkins/agent
+      volumeMounts:
+        - name: workspace-volume
+          mountPath: /home/jenkins/agent
+
+    - name: trufflehog
+      image: harbor.int.sebastine.ng/900/trufflehog:latest
       command: ['sh', '-c', 'sleep infinity']
       tty: true
       workingDir: /home/jenkins/agent
@@ -90,7 +81,7 @@ spec:
   }
 
   stages {
-    stage('Prepare workspace') {
+    stage('Prepare Workspace') {
       steps {
         container('jnlp') {
           sh 'git config --global --add safe.directory /home/jenkins/agent || true'
@@ -117,34 +108,7 @@ spec:
       }
     }
 
-    stage('Check Git Secrets') {
-      steps {
-        container('trufflehog') {
-          sh '''
-            pip install trufflehog
-            rm -f trufflehog.json || true
-            trufflehog --json ${GIT_REPO} > trufflehog.json
-            cat trufflehog.json
-          '''
-        }
-      }
-    }
-
-    stage('Source Composition Analysis') {
-      steps {
-        container('owasp') {
-          sh '''
-            rm -f owasp* || true
-            wget "https://raw.githubusercontent.com/sebastined/ann-java-login/master/owasp-dependency-check.sh"
-            chmod +x owasp-dependency-check.sh
-            bash owasp-dependency-check.sh
-            cat /var/lib/jenkins/OWASP-Dependency-Check/reports/dependency-check-report.xml
-          '''
-        }
-      }
-    }
-
-    stage('Build') {
+    stage('Build Java App') {
       steps {
         container('maven') {
           sh 'mvn clean package'
@@ -152,18 +116,45 @@ spec:
       }
     }
 
-    stage('Build & Push Docker Image') {
+    stage('Build & Push Java Image') {
       steps {
         container('kaniko') {
           sh '''
             IMAGE_DEST="${IMAGE_NAME}:${TAG}"
-            echo "Building ${IMAGE_DEST} with Kaniko..."
             /kaniko/executor \
               --context "$PWD" \
               --dockerfile Dockerfile \
               --destination "${IMAGE_DEST}" \
               --cache=true \
               --insecure --skip-tls-verify
+          '''
+        }
+      }
+    }
+
+    stage('Build & Push TruffleHog Image') {
+      steps {
+        container('kaniko') {
+          sh '''
+            IMAGE_TRUFFLEHOG="${REGISTRY}/trufflehog:latest"
+            /kaniko/executor \
+              --context "$PWD" \
+              --dockerfile T-Dockerfile \
+              --destination "${IMAGE_TRUFFLEHOG}" \
+              --cache=true \
+              --insecure --skip-tls-verify
+          '''
+        }
+      }
+    }
+
+    stage('Run TruffleHog Scan') {
+      steps {
+        container('trufflehog') {
+          sh '''
+            rm -f trufflehog.json || true
+            trufflehog --json ${GIT_REPO} > trufflehog.json
+            cat trufflehog.json
           '''
         }
       }
